@@ -1,886 +1,458 @@
 import os
 import sqlite3
-import hashlib
 import secrets
+import hashlib
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="Mars Server")
+APP_TITLE = "Mars API"
+DB_PATH = os.getenv("MARS_DB_PATH", "mars.db")
+app = FastAPI(title=APP_TITLE, version="1.0.0")
 
-DB_PATH = os.getenv("DB_PATH", "mars.db")
-VERIFY_KEY = os.getenv("MARS_VERIFY_KEY", "CHANGE_THIS_VERIFY_KEY")
-
-GREEN_GIFTS = {
+GIFTS = {
     "Одеяло": 17,
     "Подушка": 25,
     "Дом": 50,
 }
+PACKAGES = [
+    {"green": 10, "price_rub": 20},
+    {"green": 15, "price_rub": 27},
+    {"green": 25, "price_rub": 45},
+    {"green": 50, "price_rub": 70},
+    {"green": 100, "price_rub": 94},
+]
 
-GREEN_PACKAGES = {
-    10: 20,
-    15: 27,
-    25: 45,
-    50: 70,
-    100: 94,
-}
-
-
-# ---------- DATABASE ----------
+def now():
+    return datetime.now(timezone.utc).isoformat()
 
 def connect():
-    conn = sqlite3.connect(DB_PATH, timeout=20)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
+    con = sqlite3.connect(DB_PATH, timeout=20)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
 
 def init_db():
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
+    with connect() as con:
+        con.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
+            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
             password_hash TEXT NOT NULL,
-            display_name TEXT NOT NULL DEFAULT '',
-            bio TEXT NOT NULL DEFAULT '',
+            token TEXT UNIQUE,
             verified INTEGER NOT NULL DEFAULT 0,
             green_balance INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Миграция для старой базы.
-    columns = [
-        row["name"]
-        for row in cur.execute("PRAGMA table_info(users)").fetchall()
-    ]
-
-    if "green_balance" not in columns:
-        cur.execute(
-            "ALTER TABLE users ADD COLUMN green_balance "
-            "INTEGER NOT NULL DEFAULT 0"
-        )
-    if "display_name" not in columns:
-        cur.execute(
-            "ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''"
-        )
-    if "bio" not in columns:
-        cur.execute(
-            "ALTER TABLE users ADD COLUMN bio TEXT NOT NULL DEFAULT ''"
-        )
-    if "verified" not in columns:
-        cur.execute(
-            "ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0"
-        )
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS tokens (
-            token TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
-
-    cur.execute("""
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS contacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            contact_user_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, contact_user_id),
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(contact_user_id) REFERENCES users(id)
-        )
-    """)
-
-    cur.execute("""
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            contact_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE(user_id, contact_id)
+        );
         CREATE TABLE IF NOT EXISTS rooms (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             room_type TEXT NOT NULL DEFAULT 'group',
-            owner_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(owner_id) REFERENCES users(id)
-        )
-    """)
-
-    cur.execute("""
+            created_by INTEGER NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            room_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            UNIQUE(room_id, user_id),
-            FOREIGN KEY(room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
-
-    cur.execute("""
+            room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE(room_id, user_id)
+        );
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender_id INTEGER NOT NULL,
-            recipient_id INTEGER,
-            room_id INTEGER,
-            text TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(sender_id) REFERENCES users(id),
-            FOREIGN KEY(recipient_id) REFERENCES users(id),
-            FOREIGN KEY(room_id) REFERENCES rooms(id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS green_transactions (
+            room_id INTEGER REFERENCES rooms(id) ON DELETE CASCADE,
+            sender_id INTEGER NOT NULL REFERENCES users(id),
+            recipient_id INTEGER REFERENCES users(id),
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS green_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             amount INTEGER NOT NULL,
             kind TEXT NOT NULL,
             description TEXT NOT NULL,
-            related_user_id INTEGER,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(related_user_id) REFERENCES users(id)
-        )
-    """)
-
-    cur.execute("""
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS green_payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             package_green INTEGER NOT NULL,
-            amount_rub INTEGER NOT NULL,
+            price_rub INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
-            provider_payment_id TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
+            created_at TEXT NOT NULL
+        );
+        """)
 init_db()
 
+def password_hash(password: str) -> str:
+    # PBKDF2 is built into Python and avoids storing plaintext passwords.
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 180000)
+    return salt.hex() + "$" + digest.hex()
 
-# ---------- MODELS ----------
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt_hex, digest_hex = stored.split("$", 1)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), 180000
+        )
+        return secrets.compare_digest(digest.hex(), digest_hex)
+    except Exception:
+        return False
 
-class AuthData(BaseModel):
-    username: str
-    password: str
-
-
-class ProfileData(BaseModel):
-    display_name: Optional[str] = None
-    bio: Optional[str] = None
-
-
-class VerifyData(BaseModel):
-    key: str
-
-
-class ContactData(BaseModel):
-    username: str
-
-
-class RoomData(BaseModel):
-    name: str
-    room_type: str = "group"
-
-
-class MemberData(BaseModel):
-    username: str
-
-
-class MessageData(BaseModel):
-    text: str
-    recipient_id: Optional[int] = None
-    room_id: Optional[int] = None
-
-
-class GiftData(BaseModel):
-    username: str
-    gift: str
-
-
-class PaymentData(BaseModel):
-    package_green: int
-
-
-# ---------- AUTH HELPERS ----------
-
-def password_hash(password):
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
-
-
-def get_user(token):
+def user_by_token(token: Optional[str]):
     if not token:
-        raise HTTPException(status_code=401, detail="Missing token")
-
-    conn = connect()
-    row = conn.execute("""
-        SELECT users.*
-        FROM tokens
-        JOIN users ON users.id = tokens.user_id
-        WHERE tokens.token = ?
-    """, (token,)).fetchone()
-    conn.close()
-
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+    with connect() as con:
+        row = con.execute(
+            "SELECT * FROM users WHERE token = ?", (token,)
+        ).fetchone()
     if not row:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
+        raise HTTPException(status_code=401, detail="Неверный токен")
     return dict(row)
 
-
-def user_from_header(authorization):
+def current_user(authorization: Optional[str]):
     if not authorization:
-        raise HTTPException(status_code=401, detail="Missing authorization")
+        raise HTTPException(status_code=401, detail="Требуется авторизация")
+    token = authorization.replace("Bearer ", "", 1).strip()
+    return user_by_token(token)
 
-    token = authorization.strip()
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
+def add_history(con, user_id, amount, kind, description):
+    con.execute(
+        "INSERT INTO green_history(user_id, amount, kind, description, created_at) VALUES(?,?,?,?,?)",
+        (user_id, amount, kind, description, now())
+    )
 
-    return get_user(token)
+class Credentials(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=4, max_length=128)
 
+class ContactBody(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
 
-def require_room_member(conn, room_id, user_id):
-    row = conn.execute("""
-        SELECT 1 FROM members
-        WHERE room_id = ? AND user_id = ?
-    """, (room_id, user_id)).fetchone()
+class RoomBody(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    room_type: str = "group"
 
-    if not row:
-        raise HTTPException(status_code=403, detail="Not a room member")
+class MessageBody(BaseModel):
+    content: str = Field(min_length=1, max_length=4000)
 
+class GiftBody(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    gift: str = Field(min_length=1, max_length=80)
 
-# ---------- GENERAL ----------
+class PaymentBody(BaseModel):
+    package_green: int = Field(gt=0)
+
+class VerifyBody(BaseModel):
+    code: str = Field(min_length=1, max_length=100)
 
 @app.get("/")
-def home():
-    return {"app": "Mars", "status": "online"}
-
-
-# ---------- REGISTRATION / LOGIN ----------
+def root():
+    return {"service": APP_TITLE, "status": "ok"}
 
 @app.post("/register")
-def register(data: AuthData):
-    username = data.username.strip().lstrip("@")
-
+def register(body: Credentials):
+    username = body.username.strip()
     if len(username) < 3:
-        raise HTTPException(status_code=400, detail="Username too short")
-    if len(data.password) < 4:
-        raise HTTPException(status_code=400, detail="Password too short")
-
-    conn = connect()
-
+        raise HTTPException(status_code=400, detail="Имя должно быть не короче 3 символов")
+    token = secrets.token_urlsafe(32)
     try:
-        cur = conn.execute("""
-            INSERT INTO users (username, password_hash, display_name)
-            VALUES (?, ?, ?)
-        """, (username, password_hash(data.password), username))
-
-        user_id = cur.lastrowid
-        token = secrets.token_urlsafe(32)
-
-        conn.execute(
-            "INSERT INTO tokens (token, user_id) VALUES (?, ?)",
-            (token, user_id)
-        )
-        conn.commit()
-
-        return {
-            "ok": True,
-            "token": token,
-            "user_id": user_id,
-            "username": username
-        }
+        with connect() as con:
+            cur = con.execute(
+                "INSERT INTO users(username,password_hash,token,created_at) VALUES(?,?,?,?)",
+                (username, password_hash(body.password), token, now())
+            )
+            user_id = cur.lastrowid
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Username already exists")
-    finally:
-        conn.close()
-
+        raise HTTPException(status_code=409, detail="Это имя пользователя уже занято")
+    return {"token": token, "user_id": user_id, "username": username, "verified": False}
 
 @app.post("/login")
-def login(data: AuthData):
-    username = data.username.strip().lstrip("@")
-
-    conn = connect()
-    user = conn.execute("""
-        SELECT * FROM users WHERE username = ?
-    """, (username,)).fetchone()
-
-    if not user or user["password_hash"] != password_hash(data.password):
-        conn.close()
-        raise HTTPException(status_code=401, detail="Wrong username or password")
-
+def login(body: Credentials):
+    with connect() as con:
+        row = con.execute(
+            "SELECT * FROM users WHERE username = ?", (body.username.strip(),)
+        ).fetchone()
+    if not row or not verify_password(body.password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Неверное имя пользователя или пароль")
     token = secrets.token_urlsafe(32)
-    conn.execute(
-        "INSERT INTO tokens (token, user_id) VALUES (?, ?)",
-        (token, user["id"])
-    )
-    conn.commit()
-    conn.close()
-
-    return {
-        "ok": True,
-        "token": token,
-        "user_id": user["id"],
-        "username": username
-    }
-
-
-# ---------- PROFILE / VERIFICATION ----------
+    with connect() as con:
+        con.execute("UPDATE users SET token=? WHERE id=?", (token, row["id"]))
+    return {"token": token, "user_id": row["id"], "username": row["username"],
+            "verified": bool(row["verified"])}
 
 @app.get("/profile")
 def profile(authorization: Optional[str] = Header(default=None)):
-    user = user_from_header(authorization)
-
-    return {
-        "id": user["id"],
-        "username": user["username"],
-        "display_name": user["display_name"],
-        "bio": user["bio"],
-        "verified": bool(user["verified"]),
-        "green_balance": user["green_balance"]
-    }
-
-
-@app.put("/profile")
-def update_profile(
-    data: ProfileData,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-
-    conn = connect()
-    if data.display_name is not None:
-        conn.execute(
-            "UPDATE users SET display_name = ? WHERE id = ?",
-            (data.display_name, user["id"])
-        )
-    if data.bio is not None:
-        conn.execute(
-            "UPDATE users SET bio = ? WHERE id = ?",
-            (data.bio, user["id"])
-        )
-    conn.commit()
-    conn.close()
-
-    return {"ok": True}
-
+    user = current_user(authorization)
+    return {"id": user["id"], "username": user["username"],
+            "verified": bool(user["verified"]), "green_balance": user["green_balance"]}
 
 @app.post("/verify")
-def verify(
-    data: VerifyData,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-
-    if not VERIFY_KEY or VERIFY_KEY == "CHANGE_THIS_VERIFY_KEY":
-        raise HTTPException(
-            status_code=503,
-            detail="Verification key is not configured on the server"
-        )
-
-    if not secrets.compare_digest(data.key, VERIFY_KEY):
-        raise HTTPException(status_code=403, detail="Invalid verification key")
-
-    conn = connect()
-    conn.execute("UPDATE users SET verified = 1 WHERE id = ?", (user["id"],))
-    conn.commit()
-    conn.close()
-
-    return {"ok": True, "verified": True}
-
+def verify(body: VerifyBody, authorization: Optional[str] = Header(default=None)):
+    # A real verification code delivery flow must be configured before enabling verification.
+    raise HTTPException(status_code=501, detail="Подтверждение аккаунта пока не настроено")
 
 @app.get("/users")
 def users(authorization: Optional[str] = Header(default=None)):
-    current = user_from_header(authorization)
-
-    conn = connect()
-    rows = conn.execute("""
-        SELECT id, username, display_name, verified
-        FROM users
-        WHERE id != ?
-        ORDER BY username
-    """, (current["id"],)).fetchall()
-    conn.close()
-
-    return [dict(row) for row in rows]
-
-
-# ---------- CONTACTS ----------
+    me = current_user(authorization)
+    with connect() as con:
+        rows = con.execute(
+            "SELECT id,username,verified FROM users WHERE id != ? ORDER BY username LIMIT 200",
+            (me["id"],)
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 @app.get("/contacts")
 def get_contacts(authorization: Optional[str] = Header(default=None)):
-    user = user_from_header(authorization)
-
-    conn = connect()
-    rows = conn.execute("""
-        SELECT users.id, users.username, users.display_name, users.verified
-        FROM contacts
-        JOIN users ON users.id = contacts.contact_user_id
-        WHERE contacts.user_id = ?
-        ORDER BY users.username
-    """, (user["id"],)).fetchall()
-    conn.close()
-
-    return [dict(row) for row in rows]
-
+    me = current_user(authorization)
+    with connect() as con:
+        rows = con.execute("""
+            SELECT u.id, u.username FROM contacts c
+            JOIN users u ON u.id=c.contact_id
+            WHERE c.user_id=? ORDER BY u.username
+        """, (me["id"],)).fetchall()
+    return [dict(r) for r in rows]
 
 @app.post("/contacts")
-def add_contact(
-    data: ContactData,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-    username = data.username.strip().lstrip("@")
-
-    conn = connect()
-    target = conn.execute(
-        "SELECT id FROM users WHERE username = ?", (username,)
-    ).fetchone()
-
-    if not target:
-        conn.close()
-        raise HTTPException(status_code=404, detail="User not found")
-
-    if target["id"] == user["id"]:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Cannot add yourself")
-
-    try:
-        conn.execute("""
-            INSERT INTO contacts (user_id, contact_user_id)
-            VALUES (?, ?)
-        """, (user["id"], target["id"]))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-    finally:
-        conn.close()
-
+def add_contact(body: ContactBody, authorization: Optional[str] = Header(default=None)):
+    me = current_user(authorization)
+    with connect() as con:
+        target = con.execute("SELECT id FROM users WHERE username=?", (body.username.strip(),)).fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        if target["id"] == me["id"]:
+            raise HTTPException(status_code=400, detail="Нельзя добавить себя")
+        con.execute("INSERT OR IGNORE INTO contacts(user_id,contact_id) VALUES(?,?)",
+                    (me["id"], target["id"]))
     return {"ok": True}
-
-
-# ---------- GROUPS / CHANNELS / COMMUNITIES ----------
 
 @app.get("/rooms")
 def get_rooms(authorization: Optional[str] = Header(default=None)):
-    user = user_from_header(authorization)
-
-    conn = connect()
-    rows = conn.execute("""
-        SELECT rooms.id, rooms.name, rooms.room_type, rooms.owner_id
-        FROM rooms
-        JOIN members ON members.room_id = rooms.id
-        WHERE members.user_id = ?
-        ORDER BY rooms.id DESC
-    """, (user["id"],)).fetchall()
-    conn.close()
-
-    return [dict(row) for row in rows]
-
+    me = current_user(authorization)
+    with connect() as con:
+        rows = con.execute("""
+            SELECT r.id,r.name,r.room_type,r.created_at
+            FROM rooms r JOIN members m ON m.room_id=r.id
+            WHERE m.user_id=? ORDER BY r.id DESC
+        """, (me["id"],)).fetchall()
+    return [dict(r) for r in rows]
 
 @app.post("/rooms")
-def create_room(
-    data: RoomData,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-    name = data.name.strip()
-
-    if not name:
-        raise HTTPException(status_code=400, detail="Room name is required")
-
-    if data.room_type not in ("group", "channel", "community"):
-        raise HTTPException(status_code=400, detail="Invalid room type")
-
-    conn = connect()
-    cur = conn.execute("""
-        INSERT INTO rooms (name, room_type, owner_id)
-        VALUES (?, ?, ?)
-    """, (name, data.room_type, user["id"]))
-
-    room_id = cur.lastrowid
-    conn.execute(
-        "INSERT INTO members (room_id, user_id) VALUES (?, ?)",
-        (room_id, user["id"])
-    )
-    conn.commit()
-    conn.close()
-
-    return {"ok": True, "id": room_id, "name": name, "room_type": data.room_type}
-
+def create_room(body: RoomBody, authorization: Optional[str] = Header(default=None)):
+    me = current_user(authorization)
+    room_type = body.room_type if body.room_type in ("group", "private") else "group"
+    with connect() as con:
+        cur = con.execute(
+            "INSERT INTO rooms(name,room_type,created_by,created_at) VALUES(?,?,?,?)",
+            (body.name.strip(), room_type, me["id"], now())
+        )
+        room_id = cur.lastrowid
+        con.execute("INSERT INTO members(room_id,user_id) VALUES(?,?)", (room_id, me["id"]))
+    return {"id": room_id, "name": body.name.strip(), "room_type": room_type}
 
 @app.get("/rooms/{room_id}/members")
-def get_room_members(
-    room_id: int,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-
-    conn = connect()
-    require_room_member(conn, room_id, user["id"])
-
-    rows = conn.execute("""
-        SELECT users.id, users.username, users.display_name
-        FROM members
-        JOIN users ON users.id = members.user_id
-        WHERE members.room_id = ?
-    """, (room_id,)).fetchall()
-    conn.close()
-
-    return [dict(row) for row in rows]
-
+def get_room_members(room_id: int, authorization: Optional[str] = Header(default=None)):
+    me = current_user(authorization)
+    with connect() as con:
+        member = con.execute("SELECT 1 FROM members WHERE room_id=? AND user_id=?",
+                             (room_id, me["id"])).fetchone()
+        if not member:
+            raise HTTPException(status_code=403, detail="Нет доступа к комнате")
+        rows = con.execute("""
+            SELECT u.id,u.username FROM members m JOIN users u ON u.id=m.user_id
+            WHERE m.room_id=? ORDER BY u.username
+        """, (room_id,)).fetchall()
+    return [dict(r) for r in rows]
 
 @app.post("/rooms/{room_id}/members")
-def add_room_member(
-    room_id: int,
-    data: MemberData,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-    username = data.username.strip().lstrip("@")
-
-    conn = connect()
-    room = conn.execute(
-        "SELECT * FROM rooms WHERE id = ?", (room_id,)
-    ).fetchone()
-
-    if not room:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    require_room_member(conn, room_id, user["id"])
-
-    target = conn.execute(
-        "SELECT id FROM users WHERE username = ?", (username,)
-    ).fetchone()
-
-    if not target:
-        conn.close()
-        raise HTTPException(status_code=404, detail="User not found")
-
-    try:
-        conn.execute("""
-            INSERT INTO members (room_id, user_id)
-            VALUES (?, ?)
-        """, (room_id, target["id"]))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-    finally:
-        conn.close()
-
+def add_room_member(room_id: int, body: ContactBody,
+                    authorization: Optional[str] = Header(default=None)):
+    me = current_user(authorization)
+    with connect() as con:
+        room = con.execute("SELECT id FROM rooms WHERE id=?", (room_id,)).fetchone()
+        if not room:
+            raise HTTPException(status_code=404, detail="Комната не найдена")
+        member = con.execute("SELECT 1 FROM members WHERE room_id=? AND user_id=?",
+                             (room_id, me["id"])).fetchone()
+        if not member:
+            raise HTTPException(status_code=403, detail="Нет доступа к комнате")
+        target = con.execute("SELECT id FROM users WHERE username=?", (body.username.strip(),)).fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        con.execute("INSERT OR IGNORE INTO members(room_id,user_id) VALUES(?,?)",
+                    (room_id, target["id"]))
     return {"ok": True}
 
-
-# ---------- MESSAGES ----------
-
 @app.get("/rooms/{room_id}/messages")
-def get_room_messages(
-    room_id: int,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-
-    conn = connect()
-    require_room_member(conn, room_id, user["id"])
-
-    rows = conn.execute("""
-        SELECT messages.id, messages.sender_id, users.username AS sender,
-               messages.text, messages.created_at
-        FROM messages
-        JOIN users ON users.id = messages.sender_id
-        WHERE messages.room_id = ?
-        ORDER BY messages.id
-    """, (room_id,)).fetchall()
-    conn.close()
-
-    return [dict(row) for row in rows]
-
+def get_room_messages(room_id: int, authorization: Optional[str] = Header(default=None)):
+    me = current_user(authorization)
+    with connect() as con:
+        member = con.execute("SELECT 1 FROM members WHERE room_id=? AND user_id=?",
+                             (room_id, me["id"])).fetchone()
+        if not member:
+            raise HTTPException(status_code=403, detail="Нет доступа к комнате")
+        rows = con.execute("""
+            SELECT m.id,m.content,m.created_at,u.username AS sender
+            FROM messages m JOIN users u ON u.id=m.sender_id
+            WHERE m.room_id=? ORDER BY m.id ASC LIMIT 500
+        """, (room_id,)).fetchall()
+    return [dict(r) for r in rows]
 
 @app.post("/rooms/{room_id}/messages")
-def send_room_message(
-    room_id: int,
-    data: MessageData,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-    text = data.text.strip()
+def send_room_message(room_id: int, body: MessageBody,
+                      authorization: Optional[str] = Header(default=None)):
+    me = current_user(authorization)
+    with connect() as con:
+        member = con.execute("SELECT 1 FROM members WHERE room_id=? AND user_id=?",
+                             (room_id, me["id"])).fetchone()
+        if not member:
+            raise HTTPException(status_code=403, detail="Нет доступа к комнате")
+        cur = con.execute(
+            "INSERT INTO messages(room_id,sender_id,content,created_at) VALUES(?,?,?,?)",
+            (room_id, me["id"], body.content.strip(), now())
+        )
+        message_id = cur.lastrowid
+    return {"id": message_id, "ok": True}
 
-    if not text:
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
+@app.get("/messages/{other_username}")
+def get_private_messages(other_username: str,
+                         authorization: Optional[str] = Header(default=None)):
+    me = current_user(authorization)
+    with connect() as con:
+        other = con.execute("SELECT id FROM users WHERE username=?", (other_username,)).fetchone()
+        if not other:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        rows = con.execute("""
+            SELECT m.id,m.content,m.created_at,u.username AS sender
+            FROM messages m JOIN users u ON u.id=m.sender_id
+            WHERE (m.sender_id=? AND m.recipient_id=?)
+               OR (m.sender_id=? AND m.recipient_id=?)
+            ORDER BY m.id ASC LIMIT 500
+        """, (me["id"], other["id"], other["id"], me["id"])).fetchall()
+    return [dict(r) for r in rows]
 
-    conn = connect()
-    require_room_member(conn, room_id, user["id"])
+@app.post("/messages/{other_username}")
+def send_private_message(other_username: str, body: MessageBody,
+                         authorization: Optional[str] = Header(default=None)):
+    me = current_user(authorization)
+    with connect() as con:
+        other = con.execute("SELECT id FROM users WHERE username=?", (other_username,)).fetchone()
+        if not other:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        cur = con.execute("""
+            INSERT INTO messages(sender_id,recipient_id,content,created_at)
+            VALUES(?,?,?,?)
+        """, (me["id"], other["id"], body.content.strip(), now()))
+        message_id = cur.lastrowid
+    return {"id": message_id, "ok": True}
 
-    cur = conn.execute("""
-        INSERT INTO messages (sender_id, room_id, text)
-        VALUES (?, ?, ?)
-    """, (user["id"], room_id, text))
-
-    message_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-
-    return {"ok": True, "id": message_id}
-
-
-@app.get("/messages/{user_id}")
-def get_private_messages(
-    user_id: int,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-
-    conn = connect()
-    rows = conn.execute("""
-        SELECT messages.id, messages.sender_id, sender.username AS sender,
-               messages.recipient_id, recipient.username AS recipient,
-               messages.text, messages.created_at
-        FROM messages
-        JOIN users AS sender ON sender.id = messages.sender_id
-        JOIN users AS recipient ON recipient.id = messages.recipient_id
-        WHERE messages.room_id IS NULL
-          AND (
-              (messages.sender_id = ? AND messages.recipient_id = ?)
-              OR
-              (messages.sender_id = ? AND messages.recipient_id = ?)
-          )
-        ORDER BY messages.id
-    """, (user["id"], user_id, user_id, user["id"])).fetchall()
-    conn.close()
-
-    return [dict(row) for row in rows]
-
-
-@app.post("/messages/{user_id}")
-def send_private_message(
-    user_id: int,
-    data: MessageData,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-    text = data.text.strip()
-
-    if not text:
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
-
-    conn = connect()
-    target = conn.execute(
-        "SELECT id FROM users WHERE id = ?", (user_id,)
-    ).fetchone()
-
-    if not target:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Recipient not found")
-
-    cur = conn.execute("""
-        INSERT INTO messages (sender_id, recipient_id, text)
-        VALUES (?, ?, ?)
-    """, (user["id"], user_id, text))
-
-    message_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-
-    return {"ok": True, "id": message_id}
-
-
-# ---------- GREEN WALLET ----------
+# -------------------- GREEN --------------------
 
 @app.get("/green/balance")
 def green_balance(authorization: Optional[str] = Header(default=None)):
-    user = user_from_header(authorization)
-
-    conn = connect()
-    row = conn.execute(
-        "SELECT green_balance FROM users WHERE id = ?",
-        (user["id"],)
-    ).fetchone()
-    conn.close()
-
-    return {"balance": row["green_balance"]}
-
-
-@app.get("/green/packages")
-def green_packages():
-    return [
-        {"green": amount, "price_rub": price}
-        for amount, price in GREEN_PACKAGES.items()
-    ]
-
+    me = current_user(authorization)
+    return {"balance": me["green_balance"]}
 
 @app.get("/green/gifts")
-def green_gifts():
-    return [
-        {"name": name, "price": price}
-        for name, price in GREEN_GIFTS.items()
-    ]
-
+def green_gifts(authorization: Optional[str] = Header(default=None)):
+    current_user(authorization)
+    return [{"name": name, "price": price} for name, price in GIFTS.items()]
 
 @app.post("/green/gifts/send")
-def send_green_gift(
-    data: GiftData,
-    authorization: Optional[str] = Header(default=None)
-):
-    sender = user_from_header(authorization)
-    recipient_name = data.username.strip().lstrip("@")
+def send_green_gift(body: GiftBody, authorization: Optional[str] = Header(default=None)):
+    me = current_user(authorization)
+    gift_name = body.gift.strip()
+    if gift_name not in GIFTS:
+        raise HTTPException(status_code=400, detail="Такого подарка нет в каталоге")
+    price = GIFTS[gift_name]
 
-    if data.gift not in GREEN_GIFTS:
-        raise HTTPException(status_code=400, detail="Unknown gift")
-
-    price = GREEN_GIFTS[data.gift]
-    conn = connect()
-
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-
-        recipient = conn.execute(
-            "SELECT id FROM users WHERE username = ?",
-            (recipient_name,)
-        ).fetchone()
-
+    with connect() as con:
+        # BEGIN IMMEDIATE serializes balance-changing operations to avoid overspending.
+        con.execute("BEGIN IMMEDIATE")
+        sender = con.execute("SELECT id,username,green_balance FROM users WHERE id=?",
+                             (me["id"],)).fetchone()
+        recipient = con.execute("SELECT id,username FROM users WHERE username=?",
+                                (body.username.strip(),)).fetchone()
         if not recipient:
-            raise HTTPException(status_code=404, detail="Recipient not found")
-
+            raise HTTPException(status_code=404, detail="Получатель не найден")
         if recipient["id"] == sender["id"]:
-            raise HTTPException(status_code=400, detail="Cannot gift yourself")
+            raise HTTPException(status_code=400, detail="Нельзя отправить подарок самому себе")
+        if sender["green_balance"] < price:
+            raise HTTPException(status_code=400, detail="Недостаточно Green")
 
-        current = conn.execute(
-            "SELECT green_balance FROM users WHERE id = ?",
-            (sender["id"],)
-        ).fetchone()
+        con.execute("UPDATE users SET green_balance=green_balance-? WHERE id=?",
+                    (price, sender["id"]))
+        # Recipient receives a gift notification/history entry, not spendable currency.
+        add_history(con, sender["id"], -price, "gift_sent",
+                    "Подарок «" + gift_name + "» отправлен пользователю " + recipient["username"])
+        add_history(con, recipient["id"], 0, "gift_received",
+                    "Вам отправлено " + gift_name.lower() + " стоимостью " + str(price) + " Green.")
+        new_balance = con.execute("SELECT green_balance FROM users WHERE id=?",
+                                  (sender["id"],)).fetchone()["green_balance"]
 
-        if current["green_balance"] < price:
-            raise HTTPException(status_code=400, detail="Not enough Green")
-
-        conn.execute("""
-            UPDATE users SET green_balance = green_balance - ?
-            WHERE id = ?
-        """, (price, sender["id"]))
-
-        conn.execute("""
-            UPDATE users SET green_balance = green_balance + ?
-            WHERE id = ?
-        """, (price, recipient["id"]))
-
-        conn.execute("""
-            INSERT INTO green_transactions
-            (user_id, amount, kind, description, related_user_id)
-            VALUES (?, ?, 'gift_sent', ?, ?)
-        """, (
-            sender["id"], -price,
-            "Подарок: " + data.gift + " пользователю @" + recipient_name,
-            recipient["id"]
-        ))
-
-        conn.execute("""
-            INSERT INTO green_transactions
-            (user_id, amount, kind, description, related_user_id)
-            VALUES (?, ?, 'gift_received', ?, ?)
-        """, (
-            recipient["id"], price,
-            "Вам отправлено " + data.gift.lower()
-            + " стоимостью " + str(price) + " Green.",
-            sender["id"]
-        ))
-
-        conn.commit()
-
-        return {
-            "ok": True,
-            "gift": data.gift,
-            "price": price,
-            "notification": "Вам отправлено " + data.gift.lower()
-            + " стоимостью " + str(price) + " Green."
-        }
-
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
+    notification = "Подарок «" + gift_name + "» отправлен пользователю " + recipient["username"]
+    return {"ok": True, "gift": gift_name, "price": price,
+            "balance": new_balance, "notification": notification}
 
 @app.get("/green/history")
 def green_history(authorization: Optional[str] = Header(default=None)):
-    user = user_from_header(authorization)
+    me = current_user(authorization)
+    with connect() as con:
+        rows = con.execute("""
+            SELECT id,amount,kind,description,created_at
+            FROM green_history WHERE user_id=? ORDER BY id DESC LIMIT 200
+        """, (me["id"],)).fetchall()
+    return [dict(r) for r in rows]
 
-    conn = connect()
-    rows = conn.execute("""
-        SELECT id, amount, kind, description, created_at
-        FROM green_transactions
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 100
-    """, (user["id"],)).fetchall()
-    conn.close()
-
-    return [dict(row) for row in rows]
-
-
-# ---------- GREEN TOP-UP ORDERS ----------
+@app.get("/green/packages")
+def green_packages(authorization: Optional[str] = Header(default=None)):
+    current_user(authorization)
+    return PACKAGES
 
 @app.post("/green/payments")
-def create_green_payment(
-    data: PaymentData,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-
-    if data.package_green not in GREEN_PACKAGES:
-        raise HTTPException(status_code=400, detail="Invalid Green package")
-
-    price = GREEN_PACKAGES[data.package_green]
-
-    conn = connect()
-    cur = conn.execute("""
-        INSERT INTO green_payments
-        (user_id, package_green, amount_rub, status)
-        VALUES (?, ?, ?, 'pending')
-    """, (user["id"], data.package_green, price))
-
-    payment_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-
-    # Пока провайдер не подключён, заявка не зачисляет Green.
+def create_green_payment(body: PaymentBody,
+                         authorization: Optional[str] = Header(default=None)):
+    me = current_user(authorization)
+    package = next((p for p in PACKAGES if p["green"] == body.package_green), None)
+    if not package:
+        raise HTTPException(status_code=400, detail="Неизвестный пакет Green")
+    with connect() as con:
+        cur = con.execute("""
+            INSERT INTO green_payments(user_id,package_green,price_rub,status,created_at)
+            VALUES(?,?,?,?,?)
+        """, (me["id"], package["green"], package["price_rub"], "pending", now()))
+        payment_id = cur.lastrowid
     return {
         "ok": True,
         "payment_id": payment_id,
-        "green": data.package_green,
-        "price_rub": price,
+        "green": package["green"],
+        "price_rub": package["price_rub"],
         "status": "pending",
         "checkout_url": None,
-        "message": "Ожидает оплаты. Платёжный провайдер ещё не подключён."
+        "message": "Заявка создана. Оплата ещё не выполнена; Green пока не зачислены."
     }
 
-
 @app.get("/green/payments/{payment_id}")
-def get_green_payment(
-    payment_id: int,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = user_from_header(authorization)
-
-    conn = connect()
-    row = conn.execute("""
-        SELECT id, package_green, amount_rub, status, created_at
-        FROM green_payments
-        WHERE id = ? AND user_id = ?
-    """, (payment_id, user["id"])).fetchone()
-    conn.close()
-
+def get_green_payment(payment_id: int,
+                      authorization: Optional[str] = Header(default=None)):
+    me = current_user(authorization)
+    with connect() as con:
+        row = con.execute("""
+            SELECT id,package_green,price_rub,status,created_at
+            FROM green_payments WHERE id=? AND user_id=?
+        """, (payment_id, me["id"])).fetchone()
     if not row:
-        raise HTTPException(status_code=404, detail="Payment not found")
-
+        raise HTTPException(status_code=404, detail="Платёж не найден")
     return dict(row)
+
+@app.get("/health")
+def health():
+    return {"ok": True}
