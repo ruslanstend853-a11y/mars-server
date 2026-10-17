@@ -197,8 +197,19 @@ def profile(authorization: Optional[str] = Header(default=None)):
 
 @app.post("/verify")
 def verify(body: VerifyBody, authorization: Optional[str] = Header(default=None)):
-    # A real verification code delivery flow must be configured before enabling verification.
-    raise HTTPException(status_code=501, detail="Подтверждение аккаунта пока не настроено")
+    # Shared verification code requested for this Mars setup.
+    # Keep this code private: anyone who knows it can verify their own account.
+    verification_code = os.getenv("MARS_VERIFICATION_CODE", "M3kolorcolor2")
+    me = current_user(authorization)
+    if not secrets.compare_digest(body.code.strip(), verification_code):
+        raise HTTPException(status_code=400, detail="Неверный код подтверждения")
+    with connect() as con:
+        row = con.execute("SELECT verified FROM users WHERE id=?", (me["id"],)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Аккаунт не найден")
+        if not row["verified"]:
+            con.execute("UPDATE users SET verified=1 WHERE id=?", (me["id"],))
+    return {"ok": True, "verified": True, "message": "Аккаунт подтверждён!"}
 
 @app.get("/users")
 def users(authorization: Optional[str] = Header(default=None)):
