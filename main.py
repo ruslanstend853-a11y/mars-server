@@ -417,6 +417,40 @@ def green_packages(authorization: Optional[str] = Header(default=None)):
     current_user(authorization)
     return PACKAGES
 
+@app.post("/green/claim")
+def claim_free_green(body: PaymentBody,
+                     authorization: Optional[str] = Header(default=None)):
+    """Бесплатное начисление выбранного пакета только подтверждённым аккаунтам."""
+    me = current_user(authorization)
+    package = next((p for p in PACKAGES if p["green"] == body.package_green), None)
+    if not package:
+        raise HTTPException(status_code=400, detail="Неизвестный пакет Green")
+
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        account = con.execute(
+            "SELECT id, verified, green_balance FROM users WHERE id=?", (me["id"],)
+        ).fetchone()
+        if not account:
+            raise HTTPException(status_code=401, detail="Аккаунт не найден")
+        if not account["verified"]:
+            raise HTTPException(status_code=403, detail="Green доступны только подтверждённым аккаунтам")
+
+        amount = package["green"]
+        con.execute(
+            "UPDATE users SET green_balance = green_balance + ? WHERE id = ?",
+            (amount, account["id"])
+        )
+        add_history(con, account["id"], amount, "free_green",
+                    "Бесплатно начислено " + str(amount) + " Green")
+        new_balance = con.execute(
+            "SELECT green_balance FROM users WHERE id=?", (account["id"],)
+        ).fetchone()["green_balance"]
+
+    return {"ok": True, "green_added": amount, "balance": new_balance,
+            "message": "Начислено " + str(amount) + " Green!"}
+
+
 @app.post("/green/payments")
 def create_green_payment(body: PaymentBody,
                          authorization: Optional[str] = Header(default=None)):
