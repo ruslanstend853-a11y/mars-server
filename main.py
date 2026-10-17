@@ -3,6 +3,7 @@ import sqlite3
 import hashlib
 import secrets
 from contextlib import contextmanager
+
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
@@ -10,6 +11,20 @@ app = FastAPI(title="Марс API")
 
 DB_PATH = os.getenv("DB_PATH", "mars.db")
 VERIFY_KEY = os.getenv("MARS_VERIFY_KEY", "")
+
+GREEN_GIFTS = {
+    "Одеяло": 17,
+    "Подушка": 25,
+    "Дом": 50,
+}
+
+GREEN_PACKAGES = {
+    10: 20,
+    15: 27,
+    25: 45,
+    50: 70,
+    100: 94,
+}
 
 
 @contextmanager
@@ -65,11 +80,47 @@ def init_db():
             text TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS green_wallets(
+            user_id INTEGER PRIMARY KEY,
+            balance INTEGER NOT NULL DEFAULT 0
+                CHECK(balance >= 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS green_transactions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            operation TEXT NOT NULL,
+            description TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS green_gifts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id INTEGER NOT NULL,
+            recipient_id INTEGER NOT NULL,
+            gift_name TEXT NOT NULL,
+            cost INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS green_payment_orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            green_amount INTEGER NOT NULL,
+            price_rub INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            provider_payment_id TEXT UNIQUE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         """)
 
 
 init_db()
 
+
+# ===== МОДЕЛИ ЗАПРОСОВ =====
 
 class Credentials(BaseModel):
     username: str
@@ -96,6 +147,17 @@ class MessageRequest(BaseModel):
 class VerifyRequest(BaseModel):
     key: str
 
+
+class GreenGiftRequest(BaseModel):
+    username: str
+    gift_name: str
+
+
+class GreenOrderRequest(BaseModel):
+    green_amount: int
+
+
+# ===== ОБЩИЕ ФУНКЦИИ =====
 
 def password_hash(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
@@ -136,6 +198,24 @@ def user_info(user_id):
     return dict(row)
 
 
+def ensure_green_wallet(c, user_id):
+    c.execute(
+        "INSERT OR IGNORE INTO green_wallets(user_id, balance) "
+        "VALUES(?, 0)",
+        (user_id,)
+    )
+
+
+def add_green_transaction(c, user_id, amount, operation, description):
+    c.execute("""
+        INSERT INTO green_transactions(
+            user_id, amount, operation, description
+        ) VALUES(?,?,?,?)
+    """, (user_id, amount, operation, description))
+
+
+# ===== ОСНОВНЫЕ ENDPOINTS =====
+
 @app.get("/")
 def home():
     return {"app": "Марс", "status": "Сервер работает!"}
@@ -166,6 +246,7 @@ def register(data: Credentials):
             "INSERT INTO tokens(token_hash,user_id) VALUES(?,?)",
             (token_hash(token), uid)
         )
+        ensure_green_wallet(c, uid)
 
     return {"token": token, "user": user_info(uid)}
 
@@ -188,6 +269,7 @@ def login(data: Credentials):
             "INSERT INTO tokens(token_hash,user_id) VALUES(?,?)",
             (token_hash(token), uid)
         )
+        ensure_green_wallet(c, uid)
 
     return {"token": token, "user": user_info(uid)}
 
@@ -226,6 +308,8 @@ def users(authorization: str = Header(default="")):
 
     return [dict(r) for r in rows]
 
+
+# ===== КОНТАКТЫ =====
 
 @app.post("/contacts")
 def add_contact(data: ContactRequest,
@@ -271,6 +355,8 @@ def contacts(authorization: str = Header(default="")):
 
     return [dict(r) for r in rows]
 
+
+# ===== ГРУППЫ, КАНАЛЫ, СООБЩЕСТВА =====
 
 @app.post("/rooms")
 def create_room(data: RoomRequest,
@@ -321,7 +407,7 @@ def add_member(room_id: int, data: MemberRequest,
 
     with db() as c:
         room = c.execute(
-            "SELECT owner_id,type FROM rooms WHERE id=?",
+            "SELECT owner_id FROM rooms WHERE id=?",
             (room_id,)
         ).fetchone()
 
@@ -374,14 +460,14 @@ def room_members(room_id: int,
 def send_room_message(room_id: int, data: MessageRequest,
                       authorization: str = Header(default="")):
     uid = current_user(authorization)
-    text = data.text.strip()
+    message_text = data.text.strip()
 
-    if not text or len(text) > 5000:
+    if not message_text or len(message_text) > 5000:
         raise HTTPException(400, "Сообщение должно содержать 1–5000 символов")
 
     with db() as c:
         room = c.execute(
-            "SELECT type FROM rooms WHERE id=?",
+            "SELECT type,owner_id FROM rooms WHERE id=?",
             (room_id,)
         ).fetchone()
 
@@ -393,19 +479,13 @@ def send_room_message(room_id: int, data: MessageRequest,
         if not room or not member:
             raise HTTPException(403, "Нет доступа к этому пространству")
 
-        if room["type"] == "channel":
-            owner = c.execute(
-                "SELECT owner_id FROM rooms WHERE id=?",
-                (room_id,)
-            ).fetchone()
-
-            if owner["owner_id"] != uid:
-                raise HTTPException(403, "Публиковать может только владелец")
+        if room["type"] == "channel" and room["owner_id"] != uid:
+            raise HTTPException(403, "Публиковать может только владелец")
 
         cur = c.execute("""
             INSERT INTO messages(sender_id,room_id,text)
             VALUES(?,?,?)
-        """, (uid, room_id, text))
+        """, (uid, room_id, message_text))
 
         mid = cur.lastrowid
 
@@ -441,13 +521,15 @@ def get_room_messages(room_id: int,
     return [dict(r) for r in reversed(rows)]
 
 
+# ===== ЛИЧНЫЕ СООБЩЕНИЯ =====
+
 @app.post("/messages/{user_id}")
 def send_private_message(user_id: int, data: MessageRequest,
                          authorization: str = Header(default="")):
     uid = current_user(authorization)
-    text = data.text.strip()
+    message_text = data.text.strip()
 
-    if not text or len(text) > 5000:
+    if not message_text or len(message_text) > 5000:
         raise HTTPException(400, "Сообщение должно содержать 1–5000 символов")
 
     with db() as c:
@@ -470,7 +552,7 @@ def send_private_message(user_id: int, data: MessageRequest,
         cur = c.execute("""
             INSERT INTO messages(sender_id,recipient_id,text)
             VALUES(?,?,?)
-        """, (uid, user_id, text))
+        """, (uid, user_id, message_text))
 
         mid = cur.lastrowid
 
@@ -508,3 +590,212 @@ def get_private_messages(user_id: int,
         """, (uid, user_id, user_id, uid)).fetchall()
 
     return [dict(r) for r in reversed(rows)]
+
+
+# ===== GREEN: КАТАЛОГ И КОШЕЛЁК =====
+
+@app.get("/green/catalog")
+def green_catalog():
+    return {
+        "currency": "Green",
+        "gifts": [
+            {"name": name, "price": price}
+            for name, price in GREEN_GIFTS.items()
+        ],
+        "packages": [
+            {"green": amount, "price_rub": price}
+            for amount, price in GREEN_PACKAGES.items()
+        ],
+        "payments_enabled": False,
+        "message": "Пополнение заработает после настройки платёжного провайдера"
+    }
+
+
+@app.get("/green/wallet")
+def green_wallet(authorization: str = Header(default="")):
+    uid = current_user(authorization)
+
+    with db() as c:
+        ensure_green_wallet(c, uid)
+        row = c.execute(
+            "SELECT balance FROM green_wallets WHERE user_id=?",
+            (uid,)
+        ).fetchone()
+
+    return {"currency": "Green", "balance": row["balance"]}
+
+
+@app.get("/green/history")
+def green_history(authorization: str = Header(default="")):
+    uid = current_user(authorization)
+
+    with db() as c:
+        ensure_green_wallet(c, uid)
+
+        transactions = c.execute("""
+            SELECT id,amount,operation,description,created_at
+            FROM green_transactions
+            WHERE user_id=? ORDER BY id DESC LIMIT 100
+        """, (uid,)).fetchall()
+
+        gifts = c.execute("""
+            SELECT g.id,g.gift_name,g.cost,g.created_at,u.username AS sender
+            FROM green_gifts g
+            JOIN users u ON u.id=g.sender_id
+            WHERE g.recipient_id=?
+            ORDER BY g.id DESC LIMIT 100
+        """, (uid,)).fetchall()
+
+    return {
+        "transactions": [dict(r) for r in transactions],
+        "received_gifts": [
+            {
+                "id": r["id"],
+                "gift_name": r["gift_name"],
+                "cost": r["cost"],
+                "sender": r["sender"],
+                "notification": (
+                    "Вам отправлено " + r["gift_name"].lower()
+                    + " стоимостью " + str(r["cost"]) + " Green."
+                ),
+                "created_at": r["created_at"]
+            }
+            for r in gifts
+        ]
+    }
+
+
+@app.post("/green/gifts")
+def send_green_gift(
+    data: GreenGiftRequest,
+    authorization: str = Header(default="")
+):
+    uid = current_user(authorization)
+    recipient_name = data.username.strip()
+    gift_name = data.gift_name.strip()
+
+    if gift_name not in GREEN_GIFTS:
+        raise HTTPException(400, "Такого подарка нет в каталоге")
+
+    cost = GREEN_GIFTS[gift_name]
+
+    with db() as c:
+        # Блокируем конкурентные изменения баланса.
+        c.execute("BEGIN IMMEDIATE")
+
+        recipient = c.execute(
+            "SELECT id FROM users WHERE username=?",
+            (recipient_name,)
+        ).fetchone()
+
+        if not recipient:
+            raise HTTPException(404, "Получатель не найден")
+
+        recipient_id = recipient["id"]
+
+        if recipient_id == uid:
+            raise HTTPException(400, "Нельзя отправить подарок себе")
+
+        ensure_green_wallet(c, uid)
+        ensure_green_wallet(c, recipient_id)
+
+        wallet = c.execute(
+            "SELECT balance FROM green_wallets WHERE user_id=?",
+            (uid,)
+        ).fetchone()
+
+        if wallet["balance"] < cost:
+            raise HTTPException(400, "Недостаточно Green")
+
+        c.execute("""
+            UPDATE green_wallets
+            SET balance=balance-?
+            WHERE user_id=? AND balance>=?
+        """, (cost, uid, cost))
+
+        if c.execute("SELECT changes()").fetchone()[0] != 1:
+            raise HTTPException(400, "Недостаточно Green")
+
+        cur = c.execute("""
+            INSERT INTO green_gifts(
+                sender_id,recipient_id,gift_name,cost
+            ) VALUES(?,?,?,?)
+        """, (uid, recipient_id, gift_name, cost))
+
+        gift_id = cur.lastrowid
+
+        add_green_transaction(
+            c, uid, -cost, "gift_sent",
+            "Подарок: " + gift_name + " пользователю " + recipient_name
+        )
+
+        balance = c.execute(
+            "SELECT balance FROM green_wallets WHERE user_id=?",
+            (uid,)
+        ).fetchone()["balance"]
+
+    return {
+        "ok": True,
+        "gift_id": gift_id,
+        "gift_name": gift_name,
+        "cost": cost,
+        "currency": "Green",
+        "recipient": recipient_name,
+        "notification": (
+            "Вам отправлено " + gift_name.lower()
+            + " стоимостью " + str(cost) + " Green."
+        ),
+        "balance": balance
+    }
+
+
+# ===== ЗАКАЗЫ НА ПОПОЛНЕНИЕ =====
+# Создание заказа не означает оплату и не зачисляет Green.
+# Подтверждение платежа можно добавить после выбора провайдера.
+
+@app.post("/green/orders")
+def create_green_order(
+    data: GreenOrderRequest,
+    authorization: str = Header(default="")
+):
+    uid = current_user(authorization)
+
+    if data.green_amount not in GREEN_PACKAGES:
+        raise HTTPException(400, "Такого пакета Green нет")
+
+    price = GREEN_PACKAGES[data.green_amount]
+
+    with db() as c:
+        cur = c.execute("""
+            INSERT INTO green_payment_orders(
+                user_id,green_amount,price_rub,status
+            ) VALUES(?,?,?,'pending')
+        """, (uid, data.green_amount, price))
+
+        order_id = cur.lastrowid
+
+    return {
+        "order_id": order_id,
+        "green_amount": data.green_amount,
+        "price_rub": price,
+        "status": "pending",
+        "paid": False,
+        "message": (
+            "Заказ создан, но оплата не подключена. "
+            "Green не начислены."
+        )
+    }
+
+
+@app.get("/green/orders")
+def green_orders(authorization: str = Header(default="")):
+    uid = current_user(authorization)
+
+    with db() as c:
+        rows = c.execute("""
+            SELECT id,green_amount,price_rub,status,created_at
+            FROM green_payment_orders
+            WHERE user_id=? ORDER BY id DESC LIMIT 100
+        """, (uid,)).fetchall()
+
+    return [dict(r) for r in rows]
