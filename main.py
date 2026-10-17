@@ -1,8 +1,9 @@
+
 import os
-import sqlite3
 import secrets
+import sqlite3
 import hashlib
-from datetime import datetime, timezone
+from contextlib import contextmanager
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -10,391 +11,225 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="Марс API", version="2.0")
 
 DB_PATH = os.getenv("DB_PATH", "mars.db")
-tokens = {}
+VERIFY_KEY = os.getenv("MARS_VERIFY_KEY", "")
 
 
-def now():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def db_connect():
-    con = sqlite3.connect(DB_PATH, timeout=20)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    return con
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def init_db():
-    with db_connect() as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS contacts (
-            user_id INTEGER NOT NULL,
-            contact_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY(user_id, contact_id),
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(contact_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS rooms (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            kind TEXT NOT NULL CHECK(kind IN ('group','community')),
-            owner_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(owner_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS members (
-            room_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            PRIMARY KEY(room_id, user_id),
-            FOREIGN KEY(room_id) REFERENCES rooms(id),
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender_id INTEGER NOT NULL,
-            receiver_id INTEGER,
-            room_id INTEGER,
-            text TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(sender_id) REFERENCES users(id),
-            FOREIGN KEY(receiver_id) REFERENCES users(id),
-            FOREIGN KEY(room_id) REFERENCES rooms(id)
-        );
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                token_hash TEXT,
+                verified INTEGER NOT NULL DEFAULT 0
+            )
         """)
 
 
-init_db()
+@app.on_event("startup")
+def startup():
+    init_db()
 
 
-class Credentials(BaseModel):
-    username: str = Field(min_length=3, max_length=24)
+class RegisterData(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
     password: str = Field(min_length=8, max_length=128)
 
 
-class ContactData(BaseModel):
-    username: str = Field(min_length=3, max_length=24)
+class LoginData(BaseModel):
+    username: str
+    password: str
 
 
-class RoomData(BaseModel):
-    name: str = Field(min_length=1, max_length=60)
-    kind: str
+class VerifyData(BaseModel):
+    key: str
 
 
-class MemberData(BaseModel):
-    username: str = Field(min_length=3, max_length=24)
-
-
-class MessageData(BaseModel):
-    text: str = Field(min_length=1, max_length=4000)
-
-
-def password_hash(password, salt=None):
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"),
-        salt.encode("utf-8"), 200000
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    hashed = hashlib.scrypt(
+        password.encode(),
+        salt=bytes.fromhex(salt),
+        n=2**14,
+        r=8,
+        p=1
     ).hex()
-    return salt + ":" + digest
+    return salt + ":" + hashed
 
 
-def verify_password(password, stored):
+def check_password(password: str, stored: str) -> bool:
     try:
         salt, expected = stored.split(":", 1)
-        actual = password_hash(password, salt).split(":", 1)[1]
+        actual = hashlib.scrypt(
+            password.encode(),
+            salt=bytes.fromhex(salt),
+            n=2**14,
+            r=8,
+            p=1
+        ).hex()
         return secrets.compare_digest(actual, expected)
-    except (ValueError, AttributeError):
+    except (ValueError, TypeError):
         return False
 
 
-def current_user(authorization):
+def create_token():
+    return secrets.token_urlsafe(32)
+
+
+def get_user_id(authorization: str | None):
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Сначала войдите в аккаунт")
-    user_id = tokens.get(authorization[7:])
-    if user_id is None:
-        raise HTTPException(401, "Сессия истекла. Войдите снова")
-    return user_id
+        raise HTTPException(401, "Требуется авторизация")
 
+    token = authorization[7:].strip()
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
 
-def require_room_member(con, room_id, user_id):
-    room = con.execute(
-        "SELECT * FROM rooms WHERE id=?", (room_id,)
-    ).fetchone()
-    if not room:
-        raise HTTPException(404, "Чат не найден")
-    member = con.execute(
-        "SELECT 1 FROM members WHERE room_id=? AND user_id=?",
-        (room_id, user_id)
-    ).fetchone()
-    if not member:
-        raise HTTPException(403, "У вас нет доступа к этому чату")
-    return room
+    with db() as conn:
+        user = conn.execute(
+            "SELECT id FROM users WHERE token_hash = ?",
+            (token_hash,)
+        ).fetchone()
+
+    if not user:
+        raise HTTPException(401, "Сессия недействительна")
+
+    return user["id"]
 
 
 @app.get("/")
-def home():
-    return {"app": "Марс", "status": "Сервер работает!", "version": 2}
-
-
-@app.get("/health")
-def health():
-    return {"ok": True}
+def root():
+    return {"app": "Марс", "status": "Сервер работает!"}
 
 
 @app.post("/register")
-def register(data: Credentials):
+def register(data: RegisterData):
     username = data.username.strip()
-    if username != data.username:
-        raise HTTPException(400, "Уберите пробелы по краям имени")
 
-    with db_connect() as con:
-        try:
-            cur = con.execute(
-                "INSERT INTO users(username,password_hash,created_at) "
-                "VALUES(?,?,?)",
-                (username, password_hash(data.password), now())
+    if not username:
+        raise HTTPException(400, "Введите имя пользователя")
+
+    token = create_token()
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+    try:
+        with db() as conn:
+            cur = conn.execute(
+                """INSERT INTO users
+                   (username, password_hash, token_hash, verified)
+                   VALUES (?, ?, ?, 0)""",
+                (username, hash_password(data.password), token_hash)
             )
-            uid = cur.lastrowid
-        except sqlite3.IntegrityError:
-            raise HTTPException(409, "Это имя уже занято")
+            user_id = cur.lastrowid
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "Такое имя уже занято")
 
-    token = secrets.token_urlsafe(32)
-    tokens[token] = uid
-    return {"token": token, "user": {"id": uid, "username": username}}
-
-
-@app.post("/login")
-def login(data: Credentials):
-    with db_connect() as con:
-        user = con.execute(
-            "SELECT * FROM users WHERE username=?",
-            (data.username,)
-        ).fetchone()
-
-    if not user or not verify_password(
-        data.password, user["password_hash"]
-    ):
-        raise HTTPException(401, "Неверное имя или пароль")
-
-    token = secrets.token_urlsafe(32)
-    tokens[token] = user["id"]
     return {
         "token": token,
-        "user": {"id": user["id"], "username": user["username"]}
+        "user": {
+            "id": user_id,
+            "username": username,
+            "verified": False
+        }
     }
 
 
-@app.get("/users")
-def users(authorization: str = Header(default=None)):
-    uid = current_user(authorization)
-    with db_connect() as con:
-        rows = con.execute(
-            "SELECT id,username FROM users WHERE id!=? ORDER BY username",
-            (uid,)
-        ).fetchall()
-    return {"users": [dict(r) for r in rows]}
-
-
-@app.post("/contacts")
-def add_contact(
-    data: ContactData,
-    authorization: str = Header(default=None)
-):
-    uid = current_user(authorization)
-    with db_connect() as con:
-        user = con.execute(
-            "SELECT id,username FROM users WHERE username=?",
+@app.post("/login")
+def login(data: LoginData):
+    with db() as conn:
+        user = conn.execute(
+            "SELECT * FROM users WHERE username = ?",
             (data.username.strip(),)
         ).fetchone()
-        if not user:
-            raise HTTPException(404, "Пользователь не найден")
-        if user["id"] == uid:
-            raise HTTPException(400, "Нельзя добавить самого себя")
-        con.execute(
-            "INSERT OR IGNORE INTO contacts VALUES(?,?,?)",
-            (uid, user["id"], now())
+
+        if not user or not check_password(
+            data.password, user["password_hash"]
+        ):
+            raise HTTPException(401, "Неверный логин или пароль")
+
+        token = create_token()
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+        conn.execute(
+            "UPDATE users SET token_hash = ? WHERE id = ?",
+            (token_hash, user["id"])
         )
-    return {"status": "added", "user": dict(user)}
+
+        return {
+            "token": token,
+            "user": {
+                "id": user["id"],
+                "username": user["username"],
+                "verified": bool(user["verified"])
+            }
+        }
 
 
-@app.get("/contacts")
-def contacts(authorization: str = Header(default=None)):
-    uid = current_user(authorization)
-    with db_connect() as con:
-        rows = con.execute("""
-            SELECT u.id,u.username
-            FROM contacts c JOIN users u ON u.id=c.contact_id
-            WHERE c.user_id=? ORDER BY u.username
-        """, (uid,)).fetchall()
-    return {"contacts": [dict(r) for r in rows]}
+@app.get("/profile")
+def profile(authorization: str | None = Header(default=None)):
+    user_id = get_user_id(authorization)
 
-
-@app.post("/rooms")
-def create_room(
-    data: RoomData,
-    authorization: str = Header(default=None)
-):
-    uid = current_user(authorization)
-    name = data.name.strip()
-    if not name:
-        raise HTTPException(400, "Введите название")
-    if data.kind not in ("group", "community"):
-        raise HTTPException(400, "Тип должен быть group или community")
-
-    with db_connect() as con:
-        cur = con.execute(
-            "INSERT INTO rooms(name,kind,owner_id,created_at) VALUES(?,?,?,?)",
-            (name, data.kind, uid, now())
-        )
-        rid = cur.lastrowid
-        con.execute(
-            "INSERT INTO members(room_id,user_id) VALUES(?,?)",
-            (rid, uid)
-        )
-    return {"id": rid, "name": name, "kind": data.kind}
-
-
-@app.get("/rooms")
-def list_rooms(authorization: str = Header(default=None)):
-    uid = current_user(authorization)
-    with db_connect() as con:
-        rows = con.execute("""
-            SELECT r.id,r.name,r.kind,r.owner_id
-            FROM rooms r JOIN members m ON m.room_id=r.id
-            WHERE m.user_id=? ORDER BY r.id DESC
-        """, (uid,)).fetchall()
-    return {"rooms": [dict(r) for r in rows]}
-
-
-@app.post("/rooms/{room_id}/members")
-def add_member(
-    room_id: int,
-    data: MemberData,
-    authorization: str = Header(default=None)
-):
-    uid = current_user(authorization)
-    with db_connect() as con:
-        room = require_room_member(con, room_id, uid)
-        if room["owner_id"] != uid:
-            raise HTTPException(403, "Добавлять участников может создатель")
-
-        user = con.execute(
-            "SELECT id,username FROM users WHERE username=?",
-            (data.username.strip(),)
+    with db() as conn:
+        user = conn.execute(
+            "SELECT id, username, verified FROM users WHERE id = ?",
+            (user_id,)
         ).fetchone()
-        if not user:
-            raise HTTPException(404, "Пользователь не найден")
 
-        con.execute(
-            "INSERT OR IGNORE INTO members(room_id,user_id) VALUES(?,?)",
-            (room_id, user["id"])
+    if not user:
+        raise HTTPException(404, "Аккаунт не найден")
+
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "verified": bool(user["verified"])
+    }
+
+
+@app.post("/verify")
+def verify(
+    data: VerifyData,
+    authorization: str | None = Header(default=None)
+):
+    user_id = get_user_id(authorization)
+
+    # Ключ должен храниться в переменной окружения сервера,
+    # а не в Android-приложении.
+    if not VERIFY_KEY:
+        raise HTTPException(
+            503,
+            "Администратор не настроил ключ верификации"
         )
-    return {"status": "added", "user": dict(user)}
 
+    if not secrets.compare_digest(data.key, VERIFY_KEY):
+        raise HTTPException(400, "Неверный ключ")
 
-@app.get("/rooms/{room_id}/members")
-def room_members(
-    room_id: int,
-    authorization: str = Header(default=None)
-):
-    uid = current_user(authorization)
-    with db_connect() as con:
-        require_room_member(con, room_id, uid)
-        rows = con.execute("""
-            SELECT u.id,u.username
-            FROM members m JOIN users u ON u.id=m.user_id
-            WHERE m.room_id=? ORDER BY u.username
-        """, (room_id,)).fetchall()
-    return {"members": [dict(r) for r in rows]}
-
-
-@app.post("/rooms/{room_id}/messages")
-def room_send(
-    room_id: int,
-    data: MessageData,
-    authorization: str = Header(default=None)
-):
-    uid = current_user(authorization)
-    text = data.text.strip()
-    if not text:
-        raise HTTPException(400, "Пустое сообщение")
-    with db_connect() as con:
-        require_room_member(con, room_id, uid)
-        cur = con.execute(
-            "INSERT INTO messages(sender_id,room_id,text,created_at) "
-            "VALUES(?,?,?,?)",
-            (uid, room_id, text, now())
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET verified = 1 WHERE id = ?",
+            (user_id,)
         )
-    return {"id": cur.lastrowid, "status": "sent"}
 
-
-@app.get("/rooms/{room_id}/messages")
-def room_history(
-    room_id: int,
-    authorization: str = Header(default=None)
-):
-    uid = current_user(authorization)
-    with db_connect() as con:
-        require_room_member(con, room_id, uid)
-        rows = con.execute("""
-            SELECT m.id,m.sender_id,u.username AS sender,
-                   m.text,m.created_at
-            FROM messages m JOIN users u ON u.id=m.sender_id
-            WHERE m.room_id=? ORDER BY m.id DESC LIMIT 200
-        """, (room_id,)).fetchall()
-    return {"messages": [dict(r) for r in reversed(rows)]}
-
-
-@app.post("/messages/{user_id}")
-def send_private(
-    user_id: int,
-    data: MessageData,
-    authorization: str = Header(default=None)
-):
-    uid = current_user(authorization)
-    text = data.text.strip()
-    if not text:
-        raise HTTPException(400, "Пустое сообщение")
-    if user_id == uid:
-        raise HTTPException(400, "Нельзя писать самому себе")
-
-    with db_connect() as con:
-        target = con.execute(
-            "SELECT id FROM users WHERE id=?", (user_id,)
+        user = conn.execute(
+            "SELECT id, username, verified FROM users WHERE id = ?",
+            (user_id,)
         ).fetchone()
-        if not target:
-            raise HTTPException(404, "Пользователь не найден")
-        cur = con.execute(
-            "INSERT INTO messages(sender_id,receiver_id,text,created_at) "
-            "VALUES(?,?,?,?)",
-            (uid, user_id, text, now())
-        )
-    return {"id": cur.lastrowid, "status": "sent"}
 
-
-@app.get("/messages/{user_id}")
-def private_history(
-    user_id: int,
-    authorization: str = Header(default=None)
-):
-    uid = current_user(authorization)
-    with db_connect() as con:
-        rows = con.execute("""
-            SELECT m.id,m.sender_id,m.receiver_id,u.username AS sender,
-                   m.text,m.created_at
-            FROM messages m JOIN users u ON u.id=m.sender_id
-            WHERE (m.sender_id=? AND m.receiver_id=?)
-               OR (m.sender_id=? AND m.receiver_id=?)
-            ORDER BY m.id DESC LIMIT 200
-        """, (uid, user_id, user_id, uid)).fetchall()
-    return {"messages": [dict(r) for r in reversed(rows)]}
+    return {
+        "success": True,
+        "message": "Участие в Litvon подтверждено",
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "verified": bool(user["verified"])
+        }
+    }
